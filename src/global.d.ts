@@ -20,6 +20,14 @@ declare global {
         userProfile?: string,
         previousQA?: { q: string; a?: string }[],
       ): Promise<string[]>
+      clarifyRaw(
+        goal: string,
+        context?: string,
+        note?: string,
+        type?: 'dev' | 'custom',
+        userProfile?: string,
+        previousQA?: { q: string; a?: string }[],
+      ): Promise<string>
     }
     db: {
       saveMood(payload: { note: string; mood: string; motivation: number; suggestion: string }): Promise<boolean>

@@ -1,12 +1,10 @@
 import { app, BrowserWindow, ipcMain } from 'electron'
 import fs from 'node:fs/promises'
-import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import dotenv from 'dotenv'
-import { chatWithAssistant, assessMood, breakdownTasks, clarifyTasks } from './ai'
+import { chatWithAssistant, assessMood, breakdownTasks, clarifyTasks, clarifyTasksRaw } from './ai'
 
-const require = createRequire(import.meta.url)
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 // The built directory structure
@@ -92,6 +90,18 @@ ipcMain.handle('ai:clarify', async (
   previousQA?: { q: string; a?: string }[],
 ) => {
   return await clarifyTasks(goal, context, note, type, userProfile, previousQA)
+})
+
+ipcMain.handle('ai:clarifyRaw', async (
+  _event,
+  goal: string,
+  context?: string,
+  note?: string,
+  type?: 'dev' | 'custom',
+  userProfile?: string,
+  previousQA?: { q: string; a?: string }[],
+) => {
+  return await clarifyTasksRaw(goal, context, note, type, userProfile, previousQA)
 })
 
 // Lightweight JSON persistence for mood updates

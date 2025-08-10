@@ -13,6 +13,7 @@ type TaskCard = {
   estimate: string
   done: boolean
   notes: string
+  hidden: boolean
   subtasks: { id: string; title: string; done: boolean; estimate: string; notes: string }[]
 }
 
@@ -34,11 +35,13 @@ function App() {
   const [showRightBreakdown, setShowRightBreakdown] = useState(false)
   const [createdTasks, setCreatedTasks] = useState<string[]>([])
   const [createdListName, setCreatedListName] = useState<string>('')
+  // When set, AI-generated breakdown is applied as subtasks to this card
+  const [subtasksTargetCardId, setSubtasksTargetCardId] = useState<string | null>(null)
   const [isEditingListName, setIsEditingListName] = useState(false)
   const [pendingListName, setPendingListName] = useState('')
   const [taskCards, setTaskCards] = useState<TaskCard[]>([])
   const [subtaskDrafts, setSubtaskDrafts] = useState<Record<string, string>>({})
-  const { toggleDone, updateEstimate, updateNotes, beginAddSubtask, addSubtask, toggleSubtask } =
+  const { toggleDone, updateEstimate, updateNotes, hideCard, beginAddSubtask, addSubtask, toggleSubtask } =
     useTaskCardHelpers(setTaskCards, subtaskDrafts, setSubtaskDrafts)
   const [editingTitleId, setEditingTitleId] = useState<string | null>(null)
   const [titleDraft, setTitleDraft] = useState('')
@@ -70,115 +73,301 @@ function App() {
 
   const canSend = useMemo(() => input.trim().length > 0, [input])
 
-  function computeDefaultClarifyQuestions(
-    t: 'dev' | 'custom',
-    g: string,
-    c?: string,
-    n?: string,
-  ): string[] {
-    const hay = [g || '', c || '', n || ''].join(' ').toLowerCase()
-    const includesDb = /(\bdb\b|database|postgres|mysql|sqlite|mongo|mongodb|prisma|typeorm|sequelize|mongoose|knex|sql|schema|migration|migrations)/i.test(hay)
-    if (t === 'dev') {
-      const base = [
-        'Which files/modules are impacted or should be created?',
-        'What acceptance criteria define done for this goal?',
-      ]
-      if (includesDb) {
-        base.push('Which database/ORM and schema/migrations should we use?')
+  function parseClarifyRaw(raw: string): string[] {
+    const trimmed = (raw || '').trim()
+    if (!trimmed) return []
+    // Try JSON first
+    try {
+      const parsed = JSON.parse(trimmed)
+      if (Array.isArray(parsed)) return parsed.map((x) => String(x)).filter(Boolean)
+      if (parsed && Array.isArray((parsed as any).questions)) {
+        return (parsed as any).questions.map((x: any) => String(x)).filter(Boolean)
       }
-      return base
+    } catch {}
+    // Try to split numbered/bulleted questions
+    const lines = trimmed.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+    // If we find explicit bullets or numbers, collect those
+    const bullets: string[] = []
+    for (const l of lines) {
+      const cleaned = l.replace(/^\s*[\-*•\d]+[\.)]?\s+/, '').trim()
+      // skip headings
+      if (/^here are/i.test(cleaned)) continue
+      if (/^the (current state|goals|technical environment)/i.test(cleaned)) continue
+      if (cleaned.length >= 3 && cleaned.length <= 240) bullets.push(cleaned)
+      if (bullets.length >= 7) break
     }
-    return [
-      'What exact outcome do you want to achieve?',
-      'Any constraints, deadlines, or tools to consider?',
-    ]
+    if (bullets.length > 0) return bullets
+    // Fallback: split on double newlines as paragraphs
+    const paras = trimmed
+      .split(/\n\s*\n+/)
+      .map((p) => p.replace(/\s+/g, ' ').trim())
+      .filter((p) => p.length > 0 && p.length <= 300)
+    if (paras.length > 0) return paras.slice(0, 5)
+    return []
   }
 
-  function shouldAskPriorWork(g: string, c?: string, n?: string): boolean {
-    const text = [g || '', c || '', n || ''].join(' ').toLowerCase()
-    // Clear YES signals
-    const yesSignals = [
-      /\bi (have|\'ve) worked on\b/,
-      /\bprevious(ly)?\b/,
-      /\bi (built|implemented|did) (this|similar)\b/,
-      /\b(done|built) (this|similar) before\b/,
-      /\bhave experience (with|in)\b/,
-      /\bworked on (this|a similar) (earlier|before)\b/,
-    ]
-    if (yesSignals.some((r) => r.test(text))) return false
-    // Clear NO signals
-    const noSignals = [
-      /\bnever (done|built|implemented)\b/,
-      /\b(haven't|have not) worked on\b/,
-      /\bno experience (with|in)\b/,
-      /\bfirst time\b/,
-      /\bnew to (this|it)\b/,
-      /\b(don't|do not) know how\b/,
-      /\bunsure how\b/,
-    ]
-    if (noSignals.some((r) => r.test(text))) return false
-    // Heuristic: vague goal + very limited notes/context implies no prior work
-    const goalWords = (g || '').trim().split(/\s+/).filter(Boolean).length
-    const auxLen = ((c || '').trim().length + (n || '').trim().length)
-    const techTokens = [
-      /\bpostgres(ql)?\b/i,
-      /\bmysql\b/i,
-      /\bsqlite\b/i,
-      /\bmongo(db)?\b/i,
-      /\bprisma\b/i,
-      /\btypeorm\b/i,
-      /\bsequelize\b/i,
-      /\bknex\b/i,
-      /\bschema\b/i,
-      /\bmigration(s)?\b/i,
-      /\btables?\b/i,
-      /\bindex(es)?\b/i,
-      /\bquery|queries\b/i,
-      /\belectron\b/i,
-      /\breact\b/i,
-      /\bantd|ant design\b/i,
-      /\b(ts|tsx|js|jsx)\b/i,
-    ]
-    const hasTech = techTokens.some((r) => r.test(g || '') || r.test(c || '') || r.test(n || ''))
-    if (goalWords <= 6 && auxLen < 40 && !hasTech) {
-      return false
+  // Clarifying questions now come exclusively from the AI response (no static/local fallbacks)
+
+  // (legacy buildComprehensiveContext removed; now using createIntelligentTaskQuery)
+
+  // Removed unused createEnhancedTaskPrompt (superseded by createIntelligentTaskQuery)
+
+  /**
+   * Enhanced function to generate tasks using all user answers and context
+   * This function creates a comprehensive prompt that leverages all the information
+   * gathered from clarifying questions to generate more relevant and actionable tasks.
+   * 
+   * @param goal - The primary goal or objective
+   * @param context - Initial context provided by the user
+   * @param note - Additional notes or requirements
+   * @param taskType - Whether this is a development or custom task
+   * @param questions - Array of clarifying questions asked
+   * @param answers - Array of user's answers to the questions
+   * @returns Promise<string[]> - Array of generated tasks
+   */
+  async function generateTasksFromAnswers(goal: string, context: string, note: string, taskType: 'dev' | 'custom', questions: string[], answers: string[]): Promise<string[]> {
+    // Rich context assembled via createIntelligentTaskQuery
+    // Create a more sophisticated prompt that leverages all the gathered information
+    const enhancedPrompt = createIntelligentTaskQuery(goal, context, note, taskType, questions, answers)
+
+    try {
+      // Use the AI chat function with the enhanced prompt
+      const response = await window.ai.chat([
+        { role: 'system', content: 'You are an expert project planner. Generate only the task list, no additional text.' },
+        { role: 'user', content: enhancedPrompt }
+      ])
+      
+      // Parse the response into individual tasks
+      const tasks = response
+        .split('\n')
+        .map(line => line.trim())
+        .filter(line => line.length > 0 && !line.startsWith('-') && !line.startsWith('*') && !line.match(/^\d+\./))
+        .slice(0, 8) // Limit to 8 tasks maximum
+      
+      return tasks
+    } catch (error) {
+      console.error('Error generating tasks from answers:', error)
+      
+      // Enhanced fallback with better error handling
+      try {
+        console.log('Attempting fallback to original breakdown method...')
+        const fallbackTasks = await window.ai.breakdown(goal, context, taskType)
+        console.log('Fallback tasks generated:', fallbackTasks)
+        return fallbackTasks
+      } catch (fallbackError) {
+        console.error('Fallback method also failed:', fallbackError)
+        
+        // Generate basic fallback tasks based on the goal
+        const basicTasks = [
+          `Define requirements for: ${goal}`,
+          `Plan approach for: ${goal}`,
+          `Implement core functionality for: ${goal}`,
+          `Test and validate: ${goal}`,
+          `Document and deploy: ${goal}`
+        ]
+        
+        console.log('Using basic fallback tasks:', basicTasks)
+        return basicTasks
+      }
     }
-    // Ambiguous -> ask
-    return true
+  }
+
+  /**
+   * Function to analyze user answers and create contextual insights
+   * This function analyzes the user's responses to identify patterns and requirements
+   * that can be used to create more targeted and relevant task generation prompts.
+   * 
+   * @param questions - Array of clarifying questions asked
+   * @param answers - Array of user's answers to the questions
+   * @returns Object containing analysis of technical complexity, timeline sensitivity, resource constraints, and key requirements
+   */
+  function analyzeUserAnswers(questions: string[], answers: string[]): {
+    technicalComplexity: 'low' | 'medium' | 'high'
+    timelineSensitivity: boolean
+    resourceConstraints: boolean
+    keyRequirements: string[]
+  } {
+    const allText = (questions.join(' ') + ' ' + answers.join(' ')).toLowerCase()
+    
+    // Analyze technical complexity
+    const technicalTerms = /(framework|library|api|database|file|component|function|class|method|test|deploy|build|config|architecture|infrastructure)/g
+    const technicalMatches = allText.match(technicalTerms) || []
+    let technicalComplexity: 'low' | 'medium' | 'high' = 'low'
+    if (technicalMatches.length > 5) technicalComplexity = 'high'
+    else if (technicalMatches.length > 2) technicalComplexity = 'medium'
+    
+    // Analyze timeline sensitivity
+    const timelineTerms = /(deadline|urgent|asap|quick|fast|time|schedule|due date|priority)/g
+    const timelineSensitivity = timelineTerms.test(allText)
+    
+    // Analyze resource constraints
+    const resourceTerms = /(budget|limited|constraint|resource|team|skill|experience|tool|software|hardware)/g
+    const resourceConstraints = resourceTerms.test(allText)
+    
+    // Extract key requirements
+    const keyRequirements = answers
+      .filter(answer => answer.length > 10)
+      .map(answer => answer.trim())
+      .slice(0, 3) // Top 3 most detailed answers
+    
+    return {
+      technicalComplexity,
+      timelineSensitivity,
+      resourceConstraints,
+      keyRequirements
+    }
+  }
+
+  // Function to create a comprehensive summary of user answers for better AI context
+  function createUserAnswersSummary(questions: string[], answers: string[]): string {
+    const analysis = analyzeUserAnswers(questions, answers)
+    
+    let summary = 'User Input Analysis:\n'
+    summary += `- Technical Complexity: ${analysis.technicalComplexity}\n`
+    summary += `- Timeline Sensitivity: ${analysis.timelineSensitivity ? 'Yes' : 'No'}\n`
+    summary += `- Resource Constraints: ${analysis.resourceConstraints ? 'Yes' : 'No'}\n`
+    
+    if (analysis.keyRequirements.length > 0) {
+      summary += `- Key Requirements: ${analysis.keyRequirements.join(', ')}\n`
+    }
+    
+    summary += '\nDetailed Q&A:\n'
+    questions.forEach((question, index) => {
+      const answer = answers[index] || 'Not specified'
+      summary += `Q: ${question}\nA: ${answer}\n\n`
+    })
+    
+    return summary.trim()
+  }
+
+  // Function to log task generation process for debugging and improvement
+  function logTaskGeneration(goal: string, context: string, note: string, taskType: 'dev' | 'custom', questions: string[], answers: string[], generatedTasks: string[]): void {
+    const logData = {
+      timestamp: new Date().toISOString(),
+      goal,
+      context,
+      note,
+      taskType,
+      questions,
+      answers,
+      analysis: analyzeUserAnswers(questions, answers),
+      generatedTasks,
+      promptUsed: createIntelligentTaskQuery(goal, context, note, taskType, questions, answers)
+    }
+    
+    console.log('Task Generation Log:', logData)
+    
+    // In a production environment, you might want to send this to a logging service
+    // or save it locally for analysis and improvement
+  }
+
+  /**
+   * Helper function to create intelligent task generation queries
+   * This function creates sophisticated prompts that leverage the analysis of user answers
+   * to generate more contextual and relevant task breakdowns.
+   * 
+   * @param goal - The primary goal or objective
+   * @param context - Initial context provided by the user
+   * @param note - Additional notes or requirements
+   * @param taskType - Whether this is a development or custom task
+   * @param questions - Array of clarifying questions asked
+   * @param answers - Array of user's answers to the questions
+   * @returns String containing the enhanced prompt for task generation
+   */
+  function createIntelligentTaskQuery(goal: string, context: string, note: string, taskType: 'dev' | 'custom', questions: string[], answers: string[]): string {
+    // Use the enhanced analysis function
+    const analysis = analyzeUserAnswers(questions, answers)
+    
+    // Build a context-aware query based on the analysis
+    let queryFocus = ''
+    if (analysis.technicalComplexity === 'high') queryFocus += 'Focus on detailed technical implementation and architecture, '
+    else if (analysis.technicalComplexity === 'medium') queryFocus += 'Focus on technical implementation details, '
+    else queryFocus += 'Focus on practical, actionable steps, '
+    
+    if (analysis.timelineSensitivity) queryFocus += 'Prioritize timeline and dependencies, '
+    if (analysis.resourceConstraints) queryFocus += 'Account for available resources and constraints, '
+    
+    // Create a comprehensive prompt that includes all the user's answers
+    const userAnswersSummary = createUserAnswersSummary(questions, answers)
+    
+    // Add contextual insights based on analysis
+    let contextualInsights = ''
+    if (analysis.technicalComplexity === 'high') {
+      contextualInsights += '\nNote: High technical complexity detected. Tasks should include detailed technical specifications.'
+    }
+    if (analysis.timelineSensitivity) {
+      contextualInsights += '\nNote: Timeline sensitivity detected. Tasks should consider dependencies and critical path.'
+    }
+    if (analysis.resourceConstraints) {
+      contextualInsights += '\nNote: Resource constraints detected. Tasks should be optimized for available resources.'
+    }
+    
+    return `You are an expert project planner. Create a detailed task breakdown for: "${goal}"
+
+Context: ${context || 'None provided'}
+Notes: ${note || 'None provided'}
+Task Type: ${taskType === 'dev' ? 'Development' : 'Custom'}
+
+${userAnswersSummary}
+
+${queryFocus}based on the user's detailed responses above.${contextualInsights}
+
+Requirements:
+- Generate 5-8 specific, actionable tasks
+- Tasks should follow a logical sequence and dependencies
+- Each task should be sized for 30-90 minutes of work
+- Use imperative language (e.g., "Create", "Implement", "Test")
+- Include relevant technical details when mentioned
+- Consider the user's skill level and available resources
+
+Return only the task list, one per line, without numbering or bullets.`
   }
 
   async function sendMessage() {
     if (!canSend) return
-    const userMsg: ChatMessage = { id: uid(), role: 'user', content: input.trim() }
-    setMessages((m) => [...m, userMsg])
-    setInput('')
-    if (pendingClarify) {
-      // Treat this message as answers to the current clarifying question
-      const answer = userMsg.content
-      setClarifyAnswers((prev) => {
-        const next = [...prev]
-        next[clarifyStep] = answer
-        return next
-      })
-      const nextStep = clarifyStep + 1
-      if (nextStep < clarifyQuestions.length) {
+    
+    // If we're in clarifying questions mode, handle the answer
+    if (pendingClarify && clarifyQuestions.length > 0) {
+      const currentAnswer = input.trim()
+      if (currentAnswer.length === 0) return
+      
+      // Save the current answer
+      const newAnswers = [...clarifyAnswers]
+      newAnswers[clarifyStep] = currentAnswer
+      setClarifyAnswers(newAnswers)
+      
+      // Add user's answer to chat
+      const userMsg: ChatMessage = { id: uid(), role: 'user', content: currentAnswer }
+      setMessages((m) => [...m, userMsg])
+      setInput('')
+      
+      // Check if there are more questions
+      if (clarifyStep < clarifyQuestions.length - 1) {
+        // Move to next question
+        const nextStep = clarifyStep + 1
         setClarifyStep(nextStep)
-        // Ask the next question
+        
+        // Show the next question
         setMessages((m) => [
           ...m,
-          { id: uid(), role: 'assistant', content: clarifyQuestions[nextStep] },
+          { id: uid(), role: 'assistant', content: clarifyQuestions[nextStep] }
         ])
+        
+        // Focus input for next answer
+        setTimeout(() => {
+          chatInputRef.current?.focus()
+          scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
+        }, 100)
         return
-      }
-      // If all questions answered, proceed to generate tasks
-      setPendingClarify(false)
-      // Build merged context with Q/A pairs appended to original context
-      const qa = clarifyQuestions
-        .map((q, i) => [`Q${i + 1}: ${q}`, `A${i + 1}: ${clarifyAnswers[i] || ''}`].join('\n'))
-        .join('\n')
-      setContext([originalContextRef.current, qa].filter(Boolean).join('\n'))
-      await (async function generateTasksNowInline() {
-        // Reset previous breakdown state immediately and create a request token
+      } else {
+        // All questions answered, generate tasks now
+        setPendingClarify(false)
+        const qa = clarifyQuestions
+          .map((q, i) => [`Q${i + 1}: ${q}`, `A${i + 1}: ${newAnswers[i] || ''}`].join('\n'))
+          .join('\n')
+        setContext([originalContextRef.current, qa].filter(Boolean).join('\n'))
+        
+        // Generate tasks using the enhanced function that leverages all user answers
         setTasks([])
         setTasksProgress(0)
         setTasksTotal(0)
@@ -187,40 +376,115 @@ function App() {
         lastBreakdownToken.current = token
         setLoadingTasks(true)
         setTasksError(null)
+        
         try {
-          const res = await window.ai.breakdown(goal, context, taskType)
-          // Ignore stale responses if a newer breakdown has started
-          if (lastBreakdownToken.current !== token) {
-            return
+          // Use the new enhanced task generation function
+          const res = await generateTasksFromAnswers(goal, context, note, taskType, clarifyQuestions, newAnswers)
+          if (lastBreakdownToken.current !== token) return
+          
+          // Validate tasks to ensure they're all valid strings
+          const validTasks = res.filter(task => {
+            const isValid = Boolean(task && typeof task === 'string' && task.trim().length > 0);
+            if (!isValid) {
+              console.error('Filtering out invalid task:', task);
+            }
+            return isValid;
+          });
+          
+          console.log('Valid tasks generated from answers:', validTasks)
+
+          // Log the task generation process for debugging and improvement
+          logTaskGeneration(goal, context, note, taskType, clarifyQuestions, newAnswers, validTasks)
+
+          // If generating subtasks for a specific card, attach and open carousel
+          if (subtasksTargetCardId) {
+            const targetId = subtasksTargetCardId
+            const targetTitle = (taskCards.find((c) => c.id === targetId)?.title) || 'task'
+            const subtaskObjs = validTasks.map((t) => ({ id: uid(), title: t, done: false, estimate: '', notes: '' }))
+            setTaskCards((cards) =>
+              cards.map((c) => (c.id === targetId ? { ...c, subtasks: [...c.subtasks, ...subtaskObjs] } : c)),
+            )
+            setCarouselTaskId(targetId)
+            setCarouselIndex(0)
+            setTasks([])
+            setTasksProgress(0)
+            setTasksTotal(0)
+            setPendingCreateFromBreakdown(false)
+            setShowRightBreakdown(false)
+            setSubtasksTargetCardId(null)
+            setMessages((m) => [
+              ...m,
+              { id: uid(), role: 'assistant', content: `Created ${subtaskObjs.length} subtasks for "${targetTitle}". Opening the subtask carousel.` },
+            ])
+          } else {
+            // Default: show suggested tasks and Next-task flow
+            setTasks(validTasks)
+            setTasksProgress(0)
+            setTasksTotal(validTasks.length)
+            setPendingCreateFromBreakdown(false)
+            setShowRightBreakdown(false)
+            const analysis = analyzeUserAnswers(clarifyQuestions, newAnswers)
+            let influenceMessage = `Excellent! I've analyzed all your answers and generated ${validTasks.length} tailored tasks. `
+            if (analysis.technicalComplexity === 'high') {
+              influenceMessage += 'Your technical requirements helped me create detailed implementation tasks. '
+            }
+            if (analysis.timelineSensitivity) {
+              influenceMessage += 'I\'ve prioritized timeline and dependencies based on your urgency. '
+            }
+            if (analysis.resourceConstraints) {
+              influenceMessage += 'Tasks are optimized for your available resources. '
+            }
+            influenceMessage += 'Click "Next task" to review them one by one.'
+            setMessages((m) => [
+              ...m,
+              { id: uid(), role: 'assistant', content: influenceMessage },
+            ])
+            setTimeout(() => {
+              chatInputRef.current?.focus()
+              scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
+            }, 0)
           }
-          setTasks(res)
-          setTasksProgress(0)
-          setTasksTotal(res.length)
-          setPendingCreateFromBreakdown(false)
-          setShowRightBreakdown(false)
-          setMessages((m) => [
-            ...m,
-            { id: uid(), role: 'assistant', content: `I have ${res.length} suggested tasks. Click "Next task" to review them one by one.` },
-          ])
-          setTimeout(() => {
-            chatInputRef.current?.focus()
-            scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
-          }, 0)
         } catch (err: any) {
           setTasksError(err?.message ?? 'Failed to generate tasks')
         } finally {
           setLoadingTasks(false)
         }
-      })()
-      return
+        return
+      }
     }
+    
+    // Regular chat message handling
+    const userMsg: ChatMessage = { id: uid(), role: 'user', content: input.trim() }
+    setMessages((m) => [...m, userMsg])
+    setInput('')
+    
+    // Build a contextual message that includes current goal, context, and notes
+    let contextualMessage = userMsg.content
+    if (goal || context || note) {
+      const contextParts = []
+      if (goal) contextParts.push(`Goal: ${goal}`)
+      if (context) contextParts.push(`Context: ${context}`)
+      if (note) contextParts.push(`Note: ${note}`)
+      
+      if (contextParts.length > 0) {
+        contextualMessage = `${userMsg.content}\n\nCurrent context:\n${contextParts.join('\n')}`
+      }
+    }
+    
     const history = [
-      { role: 'system' as const, content: 'You are a concise, supportive coding coach.' },
+      { role: 'system' as const, content: 'You are a concise, supportive coding coach. Use the provided context (goal, context, notes) to give more relevant and helpful responses.' },
       ...messages.map((m) => ({ role: m.role, content: m.content })),
-      { role: 'user' as const, content: userMsg.content },
+      { role: 'user' as const, content: contextualMessage },
     ]
-    const reply = await window.ai.chat(history as any)
-    setMessages((m) => [...m, { id: uid(), role: 'assistant', content: reply }])
+    const placeholderId = uid()
+    setMessages((m) => [...m, { id: placeholderId, role: 'assistant', content: '…' }])
+    try {
+      const reply = await window.ai.chat(history as any)
+      setMessages((m) => m.map((msg) => (msg.id === placeholderId ? { ...msg, content: reply } : msg)))
+    } catch (err: any) {
+      const msg = String(err?.message || err || '')
+      setMessages((m) => m.map((msgI) => (msgI.id === placeholderId ? { ...msgI, content: `Error: ${msg}` } : msgI)))
+    }
   }
 
   async function checkMood() {
@@ -232,10 +496,22 @@ function App() {
     } catch {}
   }
 
-  async function makeBreakdown() {
-    if (!goal.trim()) return
+  async function makeBreakdown(taskCardOrEvent: React.MouseEvent<HTMLElement> | TaskCard | undefined) {
+    // Determine if the parameter is a TaskCard or a MouseEvent
+    const isMouseEvent = taskCardOrEvent && 'nativeEvent' in taskCardOrEvent;
+    const taskCard = !isMouseEvent ? taskCardOrEvent as TaskCard : undefined;
+    // If a task card is provided, use its data
+    if (taskCard) {
+      console.log('Task card provided:', taskCard);
+      setGoal((taskCard.title || 'Task') + ": " + (taskCard.description || ''))
+      setContext(taskCard.notes || '')
+    } else {
+      console.log('No task card provided, using current goal and context');
+    }
+    
+    if (!(goal || '').trim()) return
     // First: ask clarifying questions to improve specificity (always ask at least defaults)
-    const clarifyKey = `${taskType}::${goal.trim()}::${(context || '').trim()}::${(note || '').trim()}`
+    const clarifyKey = `${taskType}::${(goal || '').trim()}::${(context || '').trim()}::${(note || '').trim()}`
     if (lastClarifyKeyRef.current !== clarifyKey) {
       // New goal/context/note combination; reset any previous clarify state
       setClarifyQuestions([])
@@ -247,18 +523,91 @@ function App() {
     }
     let qs: string[] | null = null
     try {
+      // Assume a Jr. Software developer is trying to work on the goal
+      const userProfile = "Jr. Software Developer"
       const prevQA = clarifyQuestions.slice(0, clarifyStep).map((q, i) => ({ q, a: clarifyAnswers[i] }))
-      qs = await window.ai.clarify(goal, context, note, taskType, 'Jr Full Stack Developer', prevQA)
-    } catch {}
-    if (!qs || qs.length < 2) {
-      qs = computeDefaultClarifyQuestions(taskType, goal, context, note)
+      const raw = await window.ai.clarifyRaw(goal, context, note, taskType, userProfile, prevQA)      
+      const parsed = parseClarifyRaw(raw)
+      if (parsed.length > 0) {
+        qs = parsed
+      } else {
+        // fallback to structured clarify if raw parsing yields nothing
+        qs = await window.ai.clarify(goal, context, note, taskType, 'Software Developer', prevQA)
+      }
+    } catch (err: any) {
+      // Try a lightweight chat fallback using the latest user input and fields
+      try {
+        const lastUserMsg = [...messages].reverse().find((m) => m.role === 'user')?.content || ''
+        // Build a more meaningful, contextual prompt
+        const contextSummary = [
+          goal && `The user wants to: ${goal}`,
+          context && `They have this context: ${context}`,
+          note && `Additional notes: ${note}`,
+          `Task type: ${taskType}`
+        ].filter(Boolean).join('. ')
+        
+        const prompt = [
+          'Ask 2–4 concise clarifying questions based on this context:',
+          contextSummary,
+          '',
+          'User input: ' + lastUserMsg,
+          '',
+          'Return plain text, one question per line. No numbering, no bullets, no extra prose.'
+        ].join('\n')
+        const raw = await window.ai.chat([
+          { role: 'system', content: 'You ask only clarifying questions. Be specific and non-redundant.' },
+          { role: 'user', content: prompt },
+        ] as any)
+        const parsed = parseClarifyRaw(raw)
+        qs = parsed.length > 0 ? parsed : []
+      } catch (fallbackErr) {
+        const msg = String((fallbackErr as any)?.message || fallbackErr || '')
+        const isQuota = /429|quota|rate limit/i.test(msg)
+        setMessages((m) => [
+          ...m,
+          { id: uid(), role: 'assistant', content: isQuota
+              ? 'I could not generate clarifying questions due to rate limits. Please share any additional details (goal, files/modules, constraints), or try again shortly.'
+              : 'I hit an error generating clarifying questions. Please share any additional details (goal, files/modules, constraints), or try again.' },
+        ])
+        qs = []
+      }
     }
-    // Prepend prior-work question if needed
-    if (shouldAskPriorWork(goal, context, note)) {
-      qs = [
-        'Have you worked on a similar goal before? If yes, what did you try and what was the outcome?',
-        ...qs.filter((q) => !/worked on a similar goal/i.test(q)),
-      ]
+    if (!qs || qs.length === 0) {
+      // As a final attempt, try chat fallback even if earlier parse paths returned empty
+      try {
+        const lastUserMsg = [...messages].reverse().find((m) => m.role === 'user')?.content || ''
+        // Build a more meaningful, contextual prompt
+        const contextSummary = [
+          goal && `The user wants to: ${goal}`,
+          context && `They have this context: ${context}`,
+          note && `Additional notes: ${note}`,
+          `Task type: ${taskType}`
+        ].filter(Boolean).join('. ')
+        
+        const prompt = [
+          'Ask 2–4 concise clarifying questions based on this context:',
+          contextSummary,
+          '',
+          'User input: ' + lastUserMsg,
+          '',
+          'Return plain text, one question per line. No numbering, no bullets, no extra prose.'
+        ].join('\n')
+        const raw = await window.ai.chat([
+          { role: 'system', content: 'You ask only clarifying questions. Be specific and non-redundant.' },
+          { role: 'user', content: prompt },
+        ] as any)
+        const parsed = parseClarifyRaw(raw)
+        if (parsed.length > 0) {
+          qs = parsed
+        }
+      } catch {}
+      if (!qs || qs.length === 0) {
+        setMessages((m) => [
+          ...m,
+          { id: uid(), role: 'assistant', content: 'I could not generate clarifying questions right now. Please provide more details so I can proceed.' },
+        ])
+        return
+      }
     }
     setClarifyQuestions(qs)
     setClarifyAnswers(Array(qs.length).fill(''))
@@ -267,7 +616,7 @@ function App() {
     originalContextRef.current = context
     setMessages((m) => [
       ...m,
-      { id: uid(), role: 'assistant', content: `Before I generate tasks, a few quick questions:` },
+      { id: uid(), role: 'assistant', content: `I'd like to ask you a few questions to better understand your needs. Let's go through them one by one.` },
       { id: uid(), role: 'assistant', content: qs[0] },
     ])
     return
@@ -308,19 +657,29 @@ function App() {
 
   function handleCreateTasks(confirm: boolean) {
     if (confirm) {
+      console.log('Creating tasks from:', tasks);
       setCreatedTasks(tasks)
       const name = simplifyGoal(goal)
       setCreatedListName(name)
       // Build task cards
-      const cards: TaskCard[] = tasks.map((t) => ({
-        id: uid(),
-        title: deriveThreeWordTitle(t),
-        description: t,
-        estimate: '',
-        done: false,
-        notes: '',
-        subtasks: [],
-      }))
+      const cards: TaskCard[] = tasks.map((t) => {
+        if (!t || typeof t !== 'string') {
+          console.error('Invalid task:', t);
+          return null; // We'll filter these out below
+        }
+        const title = deriveThreeWordTitle(t);
+        console.log('Creating task card with title:', title, 'from task:', t);
+        return {
+          id: uid(),
+          title: title,
+          description: t,
+          estimate: '',
+          done: false,
+          notes: '',
+          hidden: false,
+          subtasks: [],
+        };
+      }).filter(Boolean) as TaskCard[]; // Filter out null values
       setTaskCards((prev) => [...prev, ...cards])
       setMessages((m) => [
         ...m,
@@ -341,6 +700,11 @@ function App() {
   }
 
   function deriveThreeWordTitle(text: string): string {
+    console.log('deriveThreeWordTitle input:', text);
+    if (!text || typeof text !== 'string') {
+      console.error('Invalid input to deriveThreeWordTitle:', text);
+      return 'New Task';
+    }
     const cleaned = text
       .replace(/[^\p{L}\p{N}\s'-]/gu, ' ')
       .replace(/\s+/g, ' ')
@@ -350,6 +714,7 @@ function App() {
     const titled = words
       .map((w) => (w ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : w))
       .join(' ')
+    console.log('deriveThreeWordTitle output:', titled || 'New Task');
     return titled || 'New Task'
   }
 
@@ -436,7 +801,15 @@ function App() {
             size="middle"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder="Ask for help, next steps, or guidance..."
+            placeholder={pendingClarify && clarifyQuestions.length > 0 
+              ? `Answer question ${clarifyStep + 1} of ${clarifyQuestions.length}...` 
+              : "Ask for help, next steps, or guidance..."}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault()
+                sendMessage()
+              }
+            }}
             ref={chatInputRef as any}
           />
           {tasksTotal > 0 && tasksProgress < tasksTotal && !pendingCreateFromBreakdown && !loadingTasks && !showRightBreakdown && (
@@ -502,8 +875,8 @@ function App() {
                 ]}
               />
             </Space>
-            <Input value={goal} onChange={(e) => setGoal(e.target.value)} placeholder="High-level goal" />
-            <Input.TextArea rows={3} value={context} onChange={(e) => setContext(e.target.value)} placeholder="Any context (repo, blockers, constraints)" />
+            <Input value={goal || ""} onChange={(e) => setGoal(e.target.value)} placeholder="High-level goal" />
+            <Input.TextArea rows={3} value={context || ""} onChange={(e) => setContext(e.target.value)} placeholder="Any context (repo, blockers, constraints)" />
             <Button type="primary" onClick={makeBreakdown} loading={loadingTasks}>Generate Tasks</Button>
             {tasksError && <Typography.Text type="danger">{tasksError}</Typography.Text>}
           </Space>
@@ -535,54 +908,125 @@ function App() {
           )}
           <div style={{ paddingTop: 12, flex: 1, minHeight: 0, overflow: 'auto' }}>
             {pendingClarify && clarifyQuestions.length > 0 && (
-              <div style={{ marginBottom: 12, display: 'flex', gap: 8 }}>
-                <Button size="small" onClick={() => {
-                  // Skip remaining questions and generate now
-                  setPendingClarify(false)
-                  const qa = clarifyQuestions
-                    .map((q, i) => [`Q${i + 1}: ${q}`, `A${i + 1}: ${clarifyAnswers[i] || ''}`].join('\n'))
-                    .join('\n')
-                  setContext([originalContextRef.current, qa].filter(Boolean).join('\n'))
-                  ;(async () => {
-                    setTasks([])
-                    setTasksProgress(0)
-                    setTasksTotal(0)
-                    setPendingCreateFromBreakdown(false)
-                    const token = Date.now()
-                    lastBreakdownToken.current = token
-                    setLoadingTasks(true)
-                    setTasksError(null)
+              <div style={{ marginBottom: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <div style={{ fontSize: 14, color: '#666' }}>
+                    Question {clarifyStep + 1} of {clarifyQuestions.length}
+                  </div>
+                  <div style={{ flex: 1, height: 4, background: '#f0f0f0', borderRadius: 2 }}>
+                    <div 
+                      style={{ 
+                        height: '100%', 
+                        background: '#1890ff', 
+                        borderRadius: 2, 
+                        width: `${((clarifyStep + 1) / clarifyQuestions.length) * 100}%`,
+                        transition: 'width 0.3s ease'
+                      }} 
+                    />
+                  </div>
+                </div>
+                <div style={{ 
+                  padding: 12, 
+                  background: '#f8f9fa', 
+                  borderRadius: 8, 
+                  border: '1px solid #e9ecef',
+                  fontSize: 16,
+                  fontWeight: 500
+                }}>
+                  {clarifyQuestions[clarifyStep]}
+                </div>
+                <div style={{ display: 'flex', gap: 8, justifyContent: 'space-between' }}>
+                  <Button 
+                    size="small" 
+                    onClick={() => {
+                      if (clarifyStep > 0) {
+                        const prev = clarifyStep - 1
+                        setClarifyStep(prev)
+                        setMessages((m) => [...m, { id: uid(), role: 'assistant', content: clarifyQuestions[prev] }])
+                      }
+                    }} 
+                    disabled={clarifyStep === 0}
+                  >
+                    Previous
+                  </Button>
+                  <Button 
+                    size="small" 
+                    onClick={() => {
+                      // Skip remaining questions and generate now
+                      setPendingClarify(false)
+                      const qa = clarifyQuestions
+                        .map((q, i) => [`Q${i + 1}: ${q}`, `A${i + 1}: ${clarifyAnswers[i] || ''}`].join('\n'))
+                        .join('\n')
+                      setContext([originalContextRef.current, qa].filter(Boolean).join('\n'))
+                      ;(async () => {
+                        setTasks([])
+                        setTasksProgress(0)
+                        setTasksTotal(0)
+                        setPendingCreateFromBreakdown(false)
+                        const token = Date.now()
+                        lastBreakdownToken.current = token
+                        setLoadingTasks(true)
+                        setTasksError(null)
                     try {
-                      const res = await window.ai.breakdown(goal, context, taskType)
-                      if (lastBreakdownToken.current !== token) return
-                      setTasks(res)
-                      setTasksProgress(0)
-                      setTasksTotal(res.length)
-                      setPendingCreateFromBreakdown(false)
-                      setShowRightBreakdown(false)
-                      setMessages((m) => [
-                        ...m,
-                        { id: uid(), role: 'assistant', content: `I have ${res.length} suggested tasks. Click "Next task" to review them one by one.` },
-                      ])
-                      setTimeout(() => {
-                        chatInputRef.current?.focus()
-                        scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
-                      }, 0)
-                    } catch (err: any) {
-                      setTasksError(err?.message ?? 'Failed to generate tasks')
-                    } finally {
-                      setLoadingTasks(false)
-                    }
-                  })()
-                }}>Skip questions</Button>
-                <Button size="small" onClick={() => {
-                  // Go back one question if possible and ask again
-                  if (clarifyStep > 0) {
-                    const prev = clarifyStep - 1
-                    setClarifyStep(prev)
-                    setMessages((m) => [...m, { id: uid(), role: 'assistant', content: clarifyQuestions[prev] }])
-                  }
-                }} disabled={clarifyStep === 0}>Back</Button>
+                          const res = await window.ai.breakdown(goal, context, taskType)
+                          if (lastBreakdownToken.current !== token) return
+                          
+                          // Validate tasks to ensure they're all valid strings
+                          const validTasks = res.filter(task => {
+                            const isValid = Boolean(task && typeof task === 'string' && task.trim().length > 0);
+                            if (!isValid) {
+                              console.error('Filtering out invalid task:', task);
+                            }
+                            return isValid;
+                          });
+                          
+                          console.log('Valid tasks:', validTasks);
+                          // If user clicked AI Generate Subtasks on a card, attach to that card and open carousel
+                          if (subtasksTargetCardId) {
+                            const targetId = subtasksTargetCardId
+                            const targetTitle = (taskCards.find((c) => c.id === targetId)?.title) || 'task'
+                            const subtaskObjs = validTasks.map((t) => ({ id: uid(), title: t, done: false, estimate: '', notes: '' }))
+                            setTaskCards((cards) =>
+                              cards.map((c) => (c.id === targetId ? { ...c, subtasks: [...c.subtasks, ...subtaskObjs] } : c)),
+                            )
+                            setCarouselTaskId(targetId)
+                            setCarouselIndex(0)
+                            setTasks([])
+                            setTasksProgress(0)
+                            setTasksTotal(0)
+                            setPendingCreateFromBreakdown(false)
+                            setShowRightBreakdown(false)
+                            setSubtasksTargetCardId(null)
+                            setMessages((m) => [
+                              ...m,
+                              { id: uid(), role: 'assistant', content: `Created ${subtaskObjs.length} subtasks for "${targetTitle}". Opening the subtask carousel.` },
+                            ])
+                          } else {
+                            setTasks(validTasks)
+                            setTasksProgress(0)
+                            setTasksTotal(validTasks.length)
+                            setPendingCreateFromBreakdown(false)
+                            setShowRightBreakdown(false)
+                            setMessages((m) => [
+                              ...m,
+                              { id: uid(), role: 'assistant', content: `I have ${validTasks.length} suggested tasks. Click "Next task" to review them one by one.` },
+                            ])
+                          }
+                          setTimeout(() => {
+                            chatInputRef.current?.focus()
+                            scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
+                          }, 0)
+                        } catch (err: any) {
+                          setTasksError(err?.message ?? 'Failed to generate tasks')
+                        } finally {
+                          setLoadingTasks(false)
+                        }
+                      })()
+                    }}
+                  >
+                    Skip questions
+                  </Button>
+                </div>
               </div>
             )}
             {showRightBreakdown && tasks.length > 0 ? (
@@ -710,33 +1154,43 @@ function App() {
               <Typography.Text type="secondary">No tasks yet. Generate a breakdown to create tasks.</Typography.Text>
             ) : (
               <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 12 }}>
-                {taskCards.map((card) => (
+                {taskCards.filter(card => !card.hidden).map((card) => (
                   <Card
                     key={card.id}
                     style={{ overflow: 'hidden', background: card.done ? '#f3fff3' : undefined }}
                   >
                     <div style={{ background: card.done ? '#e9fff0' : '#f6f8ff', padding: 12 }}>
-                      {editingTitleId === card.id ? (
-                        <Input
-                          autoFocus
-                          value={titleDraft}
-                          onChange={(e) => setTitleDraft(e.target.value)}
-                          onBlur={saveEditTitle}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter') saveEditTitle()
-                            if (e.key === 'Escape') cancelEditTitle()
-                          }}
-                          size="middle"
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        {editingTitleId === card.id ? (
+                          <Input
+                            autoFocus
+                            value={titleDraft}
+                            onChange={(e) => setTitleDraft(e.target.value)}
+                            onBlur={saveEditTitle}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') saveEditTitle()
+                              if (e.key === 'Escape') cancelEditTitle()
+                            }}
+                            size="middle"
+                            style={{ flex: 1 }}
+                          />
+                        ) : (
+                          <div
+                            title={card.description}
+                            onClick={() => startEditTitle(card.id, card.title)}
+                            style={{ fontWeight: 800, fontSize: 15, color: '#000', cursor: 'text', flex: 1 }}
+                          >
+                            {card.title}
+                          </div>
+                        )}
+                        <Button 
+                          type="text" 
+                          icon={<CloseOutlined />} 
+                          size="small" 
+                          onClick={() => hideCard(card.id)}
+                          style={{ marginLeft: 8 }}
                         />
-                      ) : (
-                        <div
-                          title={card.description}
-                          onClick={() => startEditTitle(card.id, card.title)}
-                          style={{ fontWeight: 800, fontSize: 15, color: '#000', cursor: 'text' }}
-                        >
-                          {card.title}
-                        </div>
-                      )}
+                      </div>
                       <Divider style={{ marginTop: 6, marginBottom: 0 }} />
                     </div>
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 12 }}>
@@ -756,7 +1210,30 @@ function App() {
                       />
                       <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
                         {card.subtasks.length === 0 && !Object.prototype.hasOwnProperty.call(subtaskDrafts, card.id) && (
-                          <Button onClick={() => { beginAddSubtask(card.id) }}>Create sub tasks</Button>
+                          <>
+                            <Button onClick={() => { beginAddSubtask(card.id) }}>Create sub tasks</Button>
+                            <Button 
+                              type="primary" 
+                              onClick={async () => {
+                                // Add messages to chat
+                                console.log('AI Generate Subtasks clicked for card:', card);
+                                // Mark which card should receive generated subtasks
+                                setSubtasksTargetCardId(card.id)
+                                setMessages(m => [
+                                  ...m,
+                                  { id: uid(), role: 'user', content: `Generate tasks from this task card: ${card.title}` },
+                                  { id: uid(), role: 'assistant', content: `I'll help break down the task "${card.title}" into smaller steps for a Jr. Software Developer.` },
+                                ])
+                                await makeBreakdown(card)
+                                // Scroll to chat
+                                setTimeout(() => {
+                                  scrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' })
+                                }, 100)
+                              }}
+                            >
+                              AI Generate Subtasks
+                            </Button>
+                          </>
                         )}
                       </div>
                       {/* Show compact subtasks list inline (checkbox + title only) */}
@@ -856,6 +1333,9 @@ function useTaskCardHelpers(
   function updateNotes(id: string, notes: string) {
     setTaskCards((cards) => cards.map((c) => (c.id === id ? { ...c, notes } : c)))
   }
+  function hideCard(id: string) {
+    setTaskCards((cards) => cards.map((c) => (c.id === id ? { ...c, hidden: true } : c)))
+  }
   function beginAddSubtask(id: string) {
     setSubtaskDrafts((d) => ({ ...d, [id]: d[id] ?? '' }))
   }
@@ -924,5 +1404,5 @@ function useTaskCardHelpers(
       </div>
     )
   }
-  return { toggleDone, updateEstimate, updateNotes, beginAddSubtask, addSubtask, renderSubtasks, toggleSubtask }
+  return { toggleDone, updateEstimate, updateNotes, hideCard, beginAddSubtask, addSubtask, renderSubtasks, toggleSubtask }
 }

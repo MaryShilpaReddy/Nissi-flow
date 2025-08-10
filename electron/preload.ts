@@ -41,6 +41,9 @@ contextBridge.exposeInMainWorld('ai', {
   clarify(goal: string, context?: string, note?: string, type?: 'dev' | 'custom', userProfile?: string, previousQA?: { q: string; a?: string }[]) {
     return ipcRenderer.invoke('ai:clarify', goal, context, note, type, userProfile, previousQA)
   },
+  clarifyRaw(goal: string, context?: string, note?: string, type?: 'dev' | 'custom', userProfile?: string, previousQA?: { q: string; a?: string }[]) {
+    return ipcRenderer.invoke('ai:clarifyRaw', goal, context, note, type, userProfile, previousQA)
+  },
 })
 
 contextBridge.exposeInMainWorld('db', {

@@ -14,3 +14,4 @@ Notes
 - Chat, mood check-in, and task breakdown are available via window.ai in the renderer.
 - IPC channels: ai:chat, ai:mood, ai:breakdown.
 
+
