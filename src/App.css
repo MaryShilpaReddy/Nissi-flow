@@ -40,3 +40,23 @@
 .read-the-docs {
   color: #888;
 }
+
+/* Subtle card-matching Start Task button */
+.startTaskBtn {
+  background: #fffaf0 !important; /* light card-like */
+  border-color: #ead6b7 !important;
+  color: #000 !important;
+  font-weight: 700 !important;
+  border-radius: 8px !important;
+  transition: background-color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease !important;
+}
+.startTaskBtn:hover {
+  background: #fef3d9 !important;
+  border-color: #e0c99f !important;
+  color: #000 !important;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.06) !important;
+}
+.startTaskBtn:active {
+  background: #fdeabf !important;
+  border-color: #d9bb8e !important;
+}

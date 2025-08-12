@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react'
 import './App.css'
-import { Layout, Typography, Input, Button, Divider, Card, Space, Checkbox, Select, FloatButton } from 'antd'
-import { SendOutlined, PlusOutlined, SmileOutlined, CodeOutlined, ProfileOutlined, CloseOutlined } from '@ant-design/icons'
+import { Layout, Typography, Input, Button, Divider, Card, Space, Checkbox, Select, FloatButton, DatePicker } from 'antd'
+import { SendOutlined, PlusOutlined, SmileOutlined, CodeOutlined, ProfileOutlined, CloseOutlined, EditOutlined } from '@ant-design/icons'
 
 type ChatMessage = { id: string; role: 'user' | 'assistant'; content: string }
 const uid = () => Math.random().toString(36).slice(2, 10)
@@ -11,9 +11,12 @@ type TaskCard = {
   title: string
   description: string
   estimate: string
+  deadline: string
   done: boolean
   notes: string
   hidden: boolean
+  status?: 'new' | 'started'
+  parentId?: string
   subtasks: { id: string; title: string; done: boolean; estimate: string; notes: string }[]
 }
 
@@ -37,14 +40,28 @@ function App() {
   const [createdListName, setCreatedListName] = useState<string>('')
   // When set, AI-generated breakdown is applied as subtasks to this card
   const [subtasksTargetCardId, setSubtasksTargetCardId] = useState<string | null>(null)
+  // Assistant focus/thread view
+  const [focusedTaskId, setFocusedTaskId] = useState<string | null>(null)
+  // (reserved) thread state for future subtasks flow
   const [isEditingListName, setIsEditingListName] = useState(false)
   const [pendingListName, setPendingListName] = useState('')
+  const [activeView, setActiveView] = useState<'dashboard' | 'assistant'>('dashboard')
   const [taskCards, setTaskCards] = useState<TaskCard[]>([])
+  // Dashboard dev-create fields
+  const [newTaskTitle, setNewTaskTitle] = useState('')
+  const [newTaskEstimate, setNewTaskEstimate] = useState('')
+  const [newTaskDeadline, setNewTaskDeadline] = useState('')
+  const [showDevCreateCard, setShowDevCreateCard] = useState(false)
+  const [devCreateCanStart, setDevCreateCanStart] = useState(false)
+  const [devCreateLastTaskId, setDevCreateLastTaskId] = useState<string | null>(null)
   const [subtaskDrafts, setSubtaskDrafts] = useState<Record<string, string>>({})
-  const { toggleDone, updateEstimate, updateNotes, hideCard, beginAddSubtask, addSubtask, toggleSubtask } =
+  const { toggleDone, updateEstimate, updateDeadline, updateNotes, hideCard, beginAddSubtask, addSubtask, toggleSubtask } =
     useTaskCardHelpers(setTaskCards, subtaskDrafts, setSubtaskDrafts)
   const [editingTitleId, setEditingTitleId] = useState<string | null>(null)
   const [titleDraft, setTitleDraft] = useState('')
+  const [editingDetailsId, setEditingDetailsId] = useState<string | null>(null)
+  const [detailsEstimateDraft, setDetailsEstimateDraft] = useState('')
+  const [detailsDeadlineDraft, setDetailsDeadlineDraft] = useState('')
   const [carouselTaskId, setCarouselTaskId] = useState<string | null>(null)
   const [carouselIndex, setCarouselIndex] = useState(0)
   const carouselTask = useMemo(() => taskCards.find((t) => t.id === carouselTaskId) ?? null, [taskCards, carouselTaskId])
@@ -418,11 +435,11 @@ Return only the task list, one per line, without numbering or bullets.`
             ])
           } else {
             // Default: show suggested tasks and Next-task flow
-            setTasks(validTasks)
-            setTasksProgress(0)
-            setTasksTotal(validTasks.length)
-            setPendingCreateFromBreakdown(false)
-            setShowRightBreakdown(false)
+          setTasks(validTasks)
+          setTasksProgress(0)
+          setTasksTotal(validTasks.length)
+          setPendingCreateFromBreakdown(false)
+          setShowRightBreakdown(false)
             const analysis = analyzeUserAnswers(clarifyQuestions, newAnswers)
             let influenceMessage = `Excellent! I've analyzed all your answers and generated ${validTasks.length} tailored tasks. `
             if (analysis.technicalComplexity === 'high') {
@@ -435,14 +452,14 @@ Return only the task list, one per line, without numbering or bullets.`
               influenceMessage += 'Tasks are optimized for your available resources. '
             }
             influenceMessage += 'Click "Next task" to review them one by one.'
-            setMessages((m) => [
-              ...m,
+          setMessages((m) => [
+            ...m,
               { id: uid(), role: 'assistant', content: influenceMessage },
-            ])
-            setTimeout(() => {
-              chatInputRef.current?.focus()
-              scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
-            }, 0)
+          ])
+          setTimeout(() => {
+            chatInputRef.current?.focus()
+            scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
+          }, 0)
           }
         } catch (err: any) {
           setTasksError(err?.message ?? 'Failed to generate tasks')
@@ -508,17 +525,19 @@ Return only the task list, one per line, without numbering or bullets.`
     } else {
       console.log('No task card provided, using current goal and context');
     }
-    
-    if (!(goal || '').trim()) return
+    // Derive effective goal/context from the provided taskCard to avoid async setState race
+    const useGoal = (taskCard ? `${taskCard.title || 'Task'}: ${taskCard.description || ''}` : goal || '').trim()
+    const useContext = taskCard ? (taskCard.notes || '') : (context || '')
+    if (!useGoal) return
     // First: ask clarifying questions to improve specificity (always ask at least defaults)
-    const clarifyKey = `${taskType}::${(goal || '').trim()}::${(context || '').trim()}::${(note || '').trim()}`
+    const clarifyKey = `${taskType}::${useGoal}::${useContext.trim()}::${(note || '').trim()}`
     if (lastClarifyKeyRef.current !== clarifyKey) {
       // New goal/context/note combination; reset any previous clarify state
       setClarifyQuestions([])
       setClarifyAnswers([])
       setClarifyStep(0)
       setPendingClarify(false)
-      originalContextRef.current = context
+      originalContextRef.current = useContext
       lastClarifyKeyRef.current = clarifyKey
     }
     let qs: string[] | null = null
@@ -526,13 +545,13 @@ Return only the task list, one per line, without numbering or bullets.`
       // Assume a Jr. Software developer is trying to work on the goal
       const userProfile = "Jr. Software Developer"
       const prevQA = clarifyQuestions.slice(0, clarifyStep).map((q, i) => ({ q, a: clarifyAnswers[i] }))
-      const raw = await window.ai.clarifyRaw(goal, context, note, taskType, userProfile, prevQA)      
+      const raw = await window.ai.clarifyRaw(useGoal, useContext, note, taskType, userProfile, prevQA)      
       const parsed = parseClarifyRaw(raw)
       if (parsed.length > 0) {
         qs = parsed
       } else {
         // fallback to structured clarify if raw parsing yields nothing
-        qs = await window.ai.clarify(goal, context, note, taskType, 'Software Developer', prevQA)
+        qs = await window.ai.clarify(useGoal, useContext, note, taskType, 'Software Developer', prevQA)
       }
     } catch (err: any) {
       // Try a lightweight chat fallback using the latest user input and fields
@@ -540,8 +559,8 @@ Return only the task list, one per line, without numbering or bullets.`
         const lastUserMsg = [...messages].reverse().find((m) => m.role === 'user')?.content || ''
         // Build a more meaningful, contextual prompt
         const contextSummary = [
-          goal && `The user wants to: ${goal}`,
-          context && `They have this context: ${context}`,
+          useGoal && `The user wants to: ${useGoal}`,
+          useContext && `They have this context: ${useContext}`,
           note && `Additional notes: ${note}`,
           `Task type: ${taskType}`
         ].filter(Boolean).join('. ')
@@ -578,8 +597,8 @@ Return only the task list, one per line, without numbering or bullets.`
         const lastUserMsg = [...messages].reverse().find((m) => m.role === 'user')?.content || ''
         // Build a more meaningful, contextual prompt
         const contextSummary = [
-          goal && `The user wants to: ${goal}`,
-          context && `They have this context: ${context}`,
+          useGoal && `The user wants to: ${useGoal}`,
+          useContext && `They have this context: ${useContext}`,
           note && `Additional notes: ${note}`,
           `Task type: ${taskType}`
         ].filter(Boolean).join('. ')
@@ -641,13 +660,45 @@ Return only the task list, one per line, without numbering or bullets.`
     if (next >= total) {
       setMessages((m) => [
         ...m,
-        { id: uid(), role: 'assistant', content: 'That’s all. Should I create new task cards for each of these?' },
+        { id: uid(), role: 'assistant', content: 'That’s all. Review above and add any you want as child tasks.' },
       ])
-      setPendingCreateFromBreakdown(true)
     }
     setTimeout(() => {
       scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
     }, 0)
+  }
+
+  function addOrSkipCurrent(add: boolean) {
+    if (tasksTotal === 0) return
+    const currentIndex = Math.max(0, tasksProgress - 1)
+    const currentText = tasks[currentIndex]
+    if (add && focusedTaskId && currentText) {
+      const title = deriveThreeWordTitle(currentText)
+      const child: TaskCard = {
+        id: uid(),
+        title,
+        description: currentText,
+        estimate: '',
+        deadline: '',
+        done: false,
+        notes: '',
+        hidden: false,
+        status: 'new',
+        parentId: focusedTaskId,
+        subtasks: [],
+      }
+      setTaskCards((prev) => [...prev, child])
+      setMessages((m) => [...m, { id: uid(), role: 'assistant', content: `Added: ${title}` }])
+    }
+    if (tasksProgress < tasksTotal) {
+      showNextTask()
+    } else {
+      // done reviewing; clear task walkthrough state
+      setTasks([])
+      setTasksProgress(0)
+      setTasksTotal(0)
+      setPendingCreateFromBreakdown(false)
+    }
   }
 
   // function copyTasks() {
@@ -661,7 +712,8 @@ Return only the task list, one per line, without numbering or bullets.`
       setCreatedTasks(tasks)
       const name = simplifyGoal(goal)
       setCreatedListName(name)
-      // Build task cards
+      // Build child task cards under focused parent if present; otherwise top-level
+      const parentId = focusedTaskId
       const cards: TaskCard[] = tasks.map((t) => {
         if (!t || typeof t !== 'string') {
           console.error('Invalid task:', t);
@@ -674,9 +726,12 @@ Return only the task list, one per line, without numbering or bullets.`
           title: title,
           description: t,
           estimate: '',
+          deadline: '',
           done: false,
           notes: '',
           hidden: false,
+          status: 'new',
+          parentId: parentId || undefined,
           subtasks: [],
         };
       }).filter(Boolean) as TaskCard[]; // Filter out null values
@@ -778,9 +833,21 @@ Return only the task list, one per line, without numbering or bullets.`
 
   // Legacy fan layout removed
 
+  function sortByDeadline(cards: TaskCard[]): TaskCard[] {
+    const parse = (d: string) => (d && /^\d{4}-\d{2}-\d{2}$/.test(d) ? Date.parse(d) : Number.POSITIVE_INFINITY)
+    return [...cards].sort((a, b) => parse(a.deadline) - parse(b.deadline))
+  }
+
   return (
     <>
-    <div style={{ position: 'fixed', inset: 0, display: 'grid', gridTemplateColumns: '40% 60%', gap: 0, padding: 0 }}>
+    {/* Top nav */}
+    <div style={{ position: 'fixed', inset: 0, display: 'flex', flexDirection: 'column' }}>
+      <div style={{ padding: 8, borderBottom: '1px solid #eee', background: '#fafafa', display: 'flex', gap: 8 }}>
+        <Button type={activeView === 'dashboard' ? 'primary' : 'default'} onClick={() => setActiveView('dashboard')}>Dashboard</Button>
+        <Button type={activeView === 'assistant' ? 'primary' : 'default'} onClick={() => setActiveView('assistant')}>Assistant</Button>
+      </div>
+      {activeView === 'assistant' ? (
+      <div style={{ flex: 1, minHeight: 0, display: 'grid', gridTemplateColumns: '40% 60%', gap: 0, padding: 0 }}>
       <Layout style={{ gridColumn: '1', height: '100%', background: '#fff' }}>
         <Layout.Header style={{ background: '#fafafa', paddingInline: 16, borderBottom: '1px solid #eee' }}>
           <Typography.Text strong>Assistant Chat</Typography.Text>
@@ -813,7 +880,11 @@ Return only the task list, one per line, without numbering or bullets.`
             ref={chatInputRef as any}
           />
           {tasksTotal > 0 && tasksProgress < tasksTotal && !pendingCreateFromBreakdown && !loadingTasks && !showRightBreakdown && (
-            <Button onClick={showNextTask}>Next task ({tasksProgress + 1}/{tasksTotal})</Button>
+            <Space>
+              <Button onClick={() => addOrSkipCurrent(true)}>Add task ({tasksProgress}/{tasksTotal})</Button>
+              <Button onClick={() => addOrSkipCurrent(false)}>Skip</Button>
+              <Button onClick={showNextTask}>Next ({tasksProgress + 1}/{tasksTotal})</Button>
+            </Space>
           )}
           <Button type="primary" icon={<SendOutlined />} onClick={sendMessage} disabled={!canSend} />
           {pendingCreateFromBreakdown && (
@@ -825,9 +896,9 @@ Return only the task list, one per line, without numbering or bullets.`
         </div>
       </Layout>
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 16, gridColumn: '2', height: '100%', overflow: 'auto', padding: 16, paddingBottom: 96 }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 16, gridColumn: '2', height: '100%', minHeight: 0, overflow: 'auto', padding: 16, paddingBottom: 96 }}>
 
-        {showMoodPanel && (
+        {!focusedTaskId && showMoodPanel && (
         <Card
           title={
             <div style={{ display: 'flex', alignItems: 'center' }}>
@@ -851,7 +922,7 @@ Return only the task list, one per line, without numbering or bullets.`
         </Card>
         )}
 
-        {showBreakdownPanel && (
+        {!focusedTaskId && showBreakdownPanel && (
         <Card
           title={
             <div style={{ display: 'flex', alignItems: 'center' }}>
@@ -967,7 +1038,7 @@ Return only the task list, one per line, without numbering or bullets.`
                         lastBreakdownToken.current = token
                         setLoadingTasks(true)
                         setTasksError(null)
-                    try {
+                        try {
                           const res = await window.ai.breakdown(goal, context, taskType)
                           if (lastBreakdownToken.current !== token) return
                           
@@ -1002,15 +1073,15 @@ Return only the task list, one per line, without numbering or bullets.`
                               { id: uid(), role: 'assistant', content: `Created ${subtaskObjs.length} subtasks for "${targetTitle}". Opening the subtask carousel.` },
                             ])
                           } else {
-                            setTasks(validTasks)
-                            setTasksProgress(0)
-                            setTasksTotal(validTasks.length)
-                            setPendingCreateFromBreakdown(false)
-                            setShowRightBreakdown(false)
-                            setMessages((m) => [
-                              ...m,
-                              { id: uid(), role: 'assistant', content: `I have ${validTasks.length} suggested tasks. Click "Next task" to review them one by one.` },
-                            ])
+                          setTasks(validTasks)
+                          setTasksProgress(0)
+                          setTasksTotal(validTasks.length)
+                          setPendingCreateFromBreakdown(false)
+                          setShowRightBreakdown(false)
+                          setMessages((m) => [
+                            ...m,
+                            { id: uid(), role: 'assistant', content: `I have ${validTasks.length} suggested tasks. Click "Next task" to review them one by one.` },
+                          ])
                           }
                           setTimeout(() => {
                             chatInputRef.current?.focus()
@@ -1029,7 +1100,54 @@ Return only the task list, one per line, without numbering or bullets.`
                 </div>
               </div>
             )}
-            {showRightBreakdown && tasks.length > 0 ? (
+            {focusedTaskId && (
+              <div style={{ border: '1px dashed #ddd', borderRadius: 8, padding: 12, marginBottom: 12 }}>
+                {(() => {
+                  const ft = taskCards.find((t) => t.id === focusedTaskId)
+                  if (!ft) return <Typography.Text type="secondary">(not found)</Typography.Text>
+                  return (
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 10 }}>
+                      <div style={{ fontWeight: 800, fontSize: 16 }}>{ft.title}</div>
+                      <div>
+                        <Typography.Text type="secondary">Estimated time</Typography.Text>
+                        <Input value={ft.estimate} onChange={(e) => updateEstimate(ft.id, e.target.value)} placeholder="e.g. 30 min" />
+                      </div>
+                      <Input.TextArea
+                        rows={3}
+                        placeholder="Notes for this task..."
+                        value={ft.notes}
+                        onChange={(e) => updateNotes(ft.id, e.target.value)}
+                      />
+                      <div>
+                        <Button
+                          type="primary"
+                          disabled={
+                            pendingClarify ||
+                            loadingTasks ||
+                            tasks.length > 0 ||
+                            (tasksTotal > 0 && tasksProgress < tasksTotal) ||
+                            pendingCreateFromBreakdown
+                          }
+                          onClick={async () => {
+                            const ftNow = taskCards.find((t) => t.id === focusedTaskId)
+                            if (!ftNow) return
+                            setTaskType('dev')
+                            // Prime chat with context
+                            setMessages(m => [
+                              ...m,
+                              { id: uid(), role: 'user', content: `Generate tasks for: ${ftNow.title}` },
+                              { id: uid(), role: 'assistant', content: 'I will ask a few clarifying questions based on the title and notes to plan tasks.' },
+                            ])
+                            await makeBreakdown(ftNow)
+                          }}
+                        >Generate Tasks</Button>
+                      </div>
+                    </div>
+                  )
+                })()}
+              </div>
+            )}
+            {!focusedTaskId && showRightBreakdown && tasks.length > 0 ? (
       <div>
                 <div style={{ fontWeight: 600, marginBottom: 8 }}>Suggested tasks</div>
                 <ol style={{ paddingLeft: 18 }}>
@@ -1042,7 +1160,7 @@ Return only the task list, one per line, without numbering or bullets.`
                   <button onClick={() => setShowRightBreakdown(false)}>Close</button>
                 </div>
               </div>
-            ) : carouselTaskId && carouselTask && carouselTotal > 0 && carouselCurrent ? (
+            ) : (!focusedTaskId && carouselTaskId && carouselTask && carouselTotal > 0 && carouselCurrent) ? (
               <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 12 }}>
                 <div
                   style={{
@@ -1150,9 +1268,9 @@ Return only the task list, one per line, without numbering or bullets.`
                   </div>
                 </div>
               </div>
-            ) : taskCards.length === 0 ? (
+            ) : (!focusedTaskId && taskCards.length === 0) ? (
               <Typography.Text type="secondary">No tasks yet. Generate a breakdown to create tasks.</Typography.Text>
-            ) : (
+            ) : (!focusedTaskId) ? (
               <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 12 }}>
                 {taskCards.filter(card => !card.hidden).map((card) => (
                   <Card
@@ -1279,12 +1397,215 @@ Return only the task list, one per line, without numbering or bullets.`
                   </Card>
                 ))}
               </div>
+            ) : (
+              // Focused view: show children under parent
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 10 }}>
+                {taskCards.filter(c => c.parentId === focusedTaskId).map((child) => (
+                  <Card key={child.id} style={{ width: '94%', marginLeft: '3%', borderColor: '#ead6b7' }}>
+                    <div style={{ fontWeight: 700 }}>{child.title}</div>
+                    <Input.TextArea rows={2} placeholder="Notes…" value={child.notes} onChange={(e) => updateNotes(child.id, e.target.value)} />
+                    <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 6 }}>
+                      <Button size="small" onClick={() => beginAddSubtask(child.id)}>Add Subtask</Button>
+                    </div>
+                  </Card>
+                ))}
+              </div>
             )}
           </div>
         </Card>
         </div>
       </div>
       </div>
+      ) : (
+        // Dashboard view: tasks only
+        <div style={{ flex: 1, minHeight: 0, overflow: 'auto', background: '#fff' }}>
+          <div style={{ padding: 16 }}>
+            {/* Development task creation card (shown via + button) */}
+            {showDevCreateCard && (
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, 340px)', gridAutoRows: 360, gap: 16, justifyContent: 'center' }}>
+                <Card key="new-dev-task" style={{ width: 340, height: 360, display: 'flex', flexDirection: 'column', justifySelf: 'center' }}>
+                  <div style={{ padding: 12, background: '#f6f8ff' }}>
+                    <Typography.Text strong>Create development task</Typography.Text>
+                  </div>
+                  <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 12, flex: 1, overflow: 'auto' }}>
+                    <div>
+                      <Typography.Text type="secondary">Title</Typography.Text>
+                      <Input placeholder="Task title" value={newTaskTitle} onChange={(e) => setNewTaskTitle(e.target.value)} />
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                      <div>
+                        <Typography.Text type="secondary">Deadline</Typography.Text>
+                        <DatePicker
+                          style={{ width: '100%' }}
+                          value={newTaskDeadline ? (window as any).dayjs?.(newTaskDeadline) : undefined}
+                          onChange={(v: any) => setNewTaskDeadline(v ? v.format('YYYY-MM-DD') : '')}
+                          allowClear
+                          showToday
+                        />
+                      </div>
+                      <div>
+                        <Typography.Text type="secondary">Estimated time</Typography.Text>
+                        <Input placeholder="e.g. 30 min" value={newTaskEstimate} onChange={(e) => setNewTaskEstimate(e.target.value)} />
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+                      <Button
+                        onClick={() => {
+                          const title = newTaskTitle.trim()
+                          if (!title) return
+                          const card: TaskCard = {
+                            id: uid(),
+                            title,
+                            description: '',
+                            estimate: newTaskEstimate.trim(),
+                            deadline: newTaskDeadline.trim(),
+                            done: false,
+                            notes: '',
+                            hidden: false,
+                            status: 'new',
+                            subtasks: [],
+                          }
+                          setTaskCards((prev) => sortByDeadline([card, ...prev]))
+                          setDevCreateCanStart(true)
+                          setDevCreateLastTaskId(card.id)
+                          setShowDevCreateCard(false)
+                        }}
+                      >Save</Button>
+                      <Button type="primary" disabled={!devCreateCanStart} onClick={() => {
+                        // Construct a temporary TaskCard object and start breakdown without adding to dashboard yet
+                        const tempCard = devCreateLastTaskId ? taskCards.find((t) => t.id === devCreateLastTaskId) : null
+                        if (!tempCard) return
+                        setDevCreateCanStart(false)
+                        setShowDevCreateCard(false)
+                        // Navigate to assistant and begin breakdown
+                        setActiveView('assistant')
+                        makeBreakdown(tempCard as any)
+                        // Clear form inputs
+                        setNewTaskTitle('')
+                        setNewTaskEstimate('')
+                        setNewTaskDeadline('')
+                      }}>Start task</Button>
+                    </div>
+                  </div>
+                </Card>
+              </div>
+            )}
+            {/* We still render the task cards list below for visibility */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, 340px)', gridAutoRows: 360, gap: 16, justifyContent: 'center', alignItems: 'start' }}>
+              {sortByDeadline(taskCards.filter(card => !card.hidden)).map((card) => (
+                <Card key={card.id} style={{ width: 340, height: 360, overflow: 'hidden', background: card.done ? '#f3fff3' : undefined, display: 'flex', flexDirection: 'column', justifySelf: 'center' }}>
+                  <div style={{ background: '#d2b48c', padding: 12 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      {editingTitleId === card.id ? (
+                        <Input
+                          autoFocus
+                          value={titleDraft}
+                          onChange={(e) => setTitleDraft(e.target.value)}
+                          onBlur={saveEditTitle}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') saveEditTitle()
+                            if (e.key === 'Escape') cancelEditTitle()
+                          }}
+                          size="middle"
+                          style={{ flex: 1 }}
+                        />
+                      ) : (
+                        <div
+                          title={card.description}
+                          style={{ fontWeight: 800, fontSize: 15, color: '#000', flex: 1 }}
+                        >
+                          {card.title}
+                        </div>
+                      )}
+                    </div>
+                    <Divider style={{ marginTop: 6, marginBottom: 0 }} />
+                  </div>
+                  {/* Edit icon moved into body top-right */}
+                  <div style={{ padding: 12, paddingBottom: 0, display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+                    <Button
+                      type="text"
+                      icon={<EditOutlined />}
+                      size="small"
+                      onClick={() => {
+                        setEditingDetailsId(card.id)
+                        setEditingTitleId(card.id)
+                        setTitleDraft(card.title)
+                        setDetailsEstimateDraft(card.estimate)
+                        setDetailsDeadlineDraft(card.deadline)
+                      }}
+                    />
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: 12, paddingTop: 8, flex: 1, overflow: 'auto' }}>
+                    <div style={{ fontSize: 11, color: '#8b5a2b', fontWeight: 700, letterSpacing: 0.3, textTransform: 'uppercase' }}>Details</div>
+                    <div style={{ border: '1px solid #ead6b7', background: '#fffaf0', borderRadius: 8, padding: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      {editingDetailsId === card.id ? (
+                        <>
+                          <div>
+                            <Typography.Text type="secondary">Estimated time</Typography.Text>
+                            <Input value={detailsEstimateDraft} onChange={(e) => setDetailsEstimateDraft(e.target.value)} placeholder="e.g. 30 min" />
+                          </div>
+                          <div>
+                            <Typography.Text type="secondary">Deadline</Typography.Text>
+                            <Input value={detailsDeadlineDraft} onChange={(e) => setDetailsDeadlineDraft(e.target.value)} placeholder="e.g. Fri 5pm" />
+                          </div>
+                          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+                            <Button onClick={() => { setEditingDetailsId(null); setEditingTitleId(null); }}>Cancel</Button>
+                            <Button type="primary" onClick={() => {
+                              updateEstimate(card.id, detailsEstimateDraft)
+                              updateDeadline(card.id, detailsDeadlineDraft)
+                              if (editingTitleId === card.id) {
+                                saveEditTitle()
+                              }
+                              setEditingDetailsId(null)
+                            }}>Save</Button>
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <div>
+                            <Typography.Text type="secondary">Estimated time: </Typography.Text>
+                            <span>{card.estimate || '-'}</span>
+                          </div>
+                          <div>
+                            <Typography.Text type="secondary">Deadline: </Typography.Text>
+                            <span>{card.deadline || '-'}</span>
+                          </div>
+                          {card.status === 'started' && (
+                            <div>
+                              <Typography.Text type="secondary">Status: </Typography.Text>
+                              <span>Started</span>
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  </div>
+                  {/* Start task below details */}
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', padding: '0 12px 12px' }}>
+                    {devCreateCanStart && devCreateLastTaskId === card.id && (
+                      <Button className="startTaskBtn" onClick={async () => {
+                        const tempCard = taskCards.find((t) => t.id === card.id)
+                        if (!tempCard) return
+                        // mark status started on this card
+                        setTaskCards((prev) => prev.map((c) => c.id === card.id ? { ...c, status: 'started' } : c))
+                        setDevCreateCanStart(false)
+                        setDevCreateLastTaskId(null)
+                        setFocusedTaskId(card.id)
+                        setActiveView('assistant')
+                        // Focus chat and scroll; user will click Generate Tasks in focused panel
+                        setTimeout(() => {
+                          chatInputRef.current?.focus()
+                          scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
+                        }, 0)
+                      }}>Start task</Button>
+            )}
+          </div>
+        </Card>
+              ))}
+        </div>
+      </div>
+      </div>
+      )}
       <FloatButton.Group shape="circle" style={{ right: 24, bottom: 24 }} trigger="click" icon={<PlusOutlined />}>
         <FloatButton
           tooltip="Mood check in"
@@ -1294,11 +1615,15 @@ Return only the task list, one per line, without numbering or bullets.`
           }}
         />
         <FloatButton
-          tooltip="Dev task breakdown"
+          tooltip="Development task"
           icon={<CodeOutlined />}
           onClick={() => {
+            if (activeView === 'dashboard') {
+              setShowDevCreateCard(true)
+            } else {
             setTaskType('dev')
             setShowBreakdownPanel(true)
+            }
           }}
         />
         <FloatButton
@@ -1312,6 +1637,7 @@ Return only the task list, one per line, without numbering or bullets.`
       </FloatButton.Group>
 
       {/* Overlay panels removed in favor of showing cards on demand */}
+    </div>
     </>
   )
 }
@@ -1329,6 +1655,9 @@ function useTaskCardHelpers(
   }
   function updateEstimate(id: string, estimate: string) {
     setTaskCards((cards) => cards.map((c) => (c.id === id ? { ...c, estimate } : c)))
+  }
+  function updateDeadline(id: string, deadline: string) {
+    setTaskCards((cards) => cards.map((c) => (c.id === id ? { ...c, deadline } : c)))
   }
   function updateNotes(id: string, notes: string) {
     setTaskCards((cards) => cards.map((c) => (c.id === id ? { ...c, notes } : c)))
@@ -1404,5 +1733,5 @@ function useTaskCardHelpers(
       </div>
     )
   }
-  return { toggleDone, updateEstimate, updateNotes, hideCard, beginAddSubtask, addSubtask, renderSubtasks, toggleSubtask }
+  return { toggleDone, updateEstimate, updateDeadline, updateNotes, hideCard, beginAddSubtask, addSubtask, renderSubtasks, toggleSubtask }
 }
